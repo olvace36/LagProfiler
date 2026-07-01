@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnableHarmony>false</EnableHarmony>
+    <IgnoreModFilePatterns>\.pdb$</IgnoreModFilePatterns>
+    <RootNamespace>LagProfiler</RootNamespace>
+    <AssemblyName>LagProfiler</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Same package used by most SMAPI mods; it auto-references the game/SMAPI DLLs
+         and packages the mod folder correctly. If your SnsAndroidFix build instead
+         references the Android Stardew Assemblies directly from libs/, use that same
+         approach here instead of this package. -->
+    <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.3.2" />
+  </ItemGroup>
+
+</Project>

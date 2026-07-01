@@ -1,0 +1,10 @@
+{
+  "Name": "Lag Profiler",
+  "Author": "Ace36",
+  "Version": "1.0.0",
+  "Description": "Diagnostic-only mod. Logs frame/tick time spikes together with current location and entity counts, to help pinpoint what's causing FPS drops.",
+  "UniqueID": "JustAce36.LagProfiler",
+  "MinimumApiVersion": "4.0.0",
+  "EntryDll": "LagProfiler.dll",
+  "UpdateKeys": []
+}
