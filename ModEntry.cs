@@ -13,7 +13,6 @@ namespace LagProfiler
         private const double SpikeThresholdMs = 50.0;   // ~below 20 FPS if a tick regularly takes this long
         private const double SummaryIntervalSec = 5.0;  // how often to print the rolling summary
 
-        private readonly Stopwatch _tickStopwatch = new();
         private readonly Stopwatch _summaryStopwatch = new();
 
         private int _ticksInWindow;
@@ -24,28 +23,44 @@ namespace LagProfiler
         public override void Entry(IModHelper helper)
         {
             helper.Events.GameLoop.UpdateTicking += OnUpdateTicking;
-            helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
             helper.Events.GameLoop.SaveLoaded += (_, _) =>
             {
                 _summaryStopwatch.Restart();
+                _frameStopwatch.Restart();
+                _hasPreviousTick = false;
                 _ticksInWindow = 0;
                 _msInWindow = 0;
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
-                Monitor.Log("LagProfiler active. Watching for ticks slower than " + SpikeThresholdMs + "ms.", LogLevel.Info);
+                Monitor.Log("LagProfiler active. Watching for full frames (Update+Draw) slower than " + SpikeThresholdMs + "ms.", LogLevel.Info);
             };
         }
 
+        private readonly Stopwatch _frameStopwatch = new();
+        private bool _hasPreviousTick;
+
         private void OnUpdateTicking(object? sender, UpdateTickingEventArgs e)
         {
-            _tickStopwatch.Restart();
+            // Measuring UpdateTicking -> UpdateTicked only times the Update (logic) phase.
+            // Draw happens *after* UpdateTicked fires, so that approach completely misses
+            // render time — which is exactly where Android GPU bottlenecks show up.
+            // Instead, time from one UpdateTicking to the next: that span covers the full
+            // Update+Draw loop iteration, matching what an on-screen FPS counter sees.
+            if (!_hasPreviousTick)
+            {
+                _frameStopwatch.Restart();
+                _hasPreviousTick = true;
+                return;
+            }
+
+            double elapsedMs = _frameStopwatch.Elapsed.TotalMilliseconds;
+            _frameStopwatch.Restart();
+
+            ProcessFrameTime(elapsedMs);
         }
 
-        private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
+        private void ProcessFrameTime(double elapsedMs)
         {
-            _tickStopwatch.Stop();
-            double elapsedMs = _tickStopwatch.Elapsed.TotalMilliseconds;
-
             if (!Context.IsWorldReady)
                 return;
 
