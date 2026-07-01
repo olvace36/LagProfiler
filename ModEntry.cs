@@ -14,6 +14,13 @@ namespace LagProfiler
         private const double SpikeThresholdMs = 50.0;   // ~below 20 FPS if a full frame regularly takes this long
         private const double SummaryIntervalSec = 5.0;  // how often to print the rolling summary
 
+        // Diagnostic toggle: the lighting timing patches (Harmony prefix/postfix on
+        // Game1.DrawLighting / Game1.DrawLightmapOnScreen) are the most invasive part of
+        // this mod — they patch hot-path engine methods rather than just listening to SMAPI
+        // events. If lag/RAM issues correlate with this mod being installed, disable this
+        // first to isolate whether the lighting patches are the cause.
+        private const bool EnableLightingTimingPatches = false;
+
         private readonly Stopwatch _summaryStopwatch = new();
         private readonly Stopwatch _frameStopwatch = new();
         private readonly Stopwatch _updateStopwatch = new();
@@ -83,6 +90,12 @@ namespace LagProfiler
                 _gen2AtWindowStart = GC.CollectionCount(2);
                 Monitor.Log("LagProfiler active. Watching for full frames (Update+Draw) slower than " + SpikeThresholdMs + "ms.", LogLevel.Info);
             };
+
+            if (!EnableLightingTimingPatches)
+            {
+                Monitor.Log("Lighting pass timing patches are disabled (diagnostic mode) — lighting=0.0ms in logs is expected right now.", LogLevel.Info);
+                return;
+            }
 
             try
             {
