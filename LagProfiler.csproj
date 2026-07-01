@@ -22,6 +22,10 @@
       <HintPath>libs\StardewModdingAPI.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="SMAPI.Toolkit.CoreInterfaces">
+      <HintPath>libs\SMAPI.Toolkit.CoreInterfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="0Harmony">
       <HintPath>libs\0Harmony.dll</HintPath>
       <Private>false</Private>
@@ -33,3 +37,4 @@
   </ItemGroup>
 
 </Project>
+
