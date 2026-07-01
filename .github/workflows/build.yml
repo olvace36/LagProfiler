@@ -20,6 +20,13 @@ jobs:
         with:
           dotnet-version: '6.0.x'
 
+      - name: Check libs/ is present
+        run: |
+          if [ ! -f "libs/StardewValley.dll" ]; then
+            echo "libs/StardewValley.dll not found — commit the Android game DLLs to libs/ (same as SnsAndroidFix), or add a step above to download/unzip them before this point."
+            exit 1
+          fi
+
       - name: Restore dependencies
         run: dotnet restore LagProfiler.csproj
 
