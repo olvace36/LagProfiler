@@ -5,44 +5,33 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '6.0.x'
-
-      - name: Check libs/ is present
-        run: |
-          if [ ! -f "libs/StardewValley.dll" ]; then
-            echo "libs/StardewValley.dll not found — commit the Android game DLLs to libs/ (same as SnsAndroidFix), or add a step above to download/unzip them before this point."
-            exit 1
-          fi
-
-      - name: Restore dependencies
-        run: dotnet restore LagProfiler.csproj
+          dotnet-version: '9.0.x'
 
       - name: Build
-        run: dotnet build LagProfiler.csproj --configuration Release --no-restore
+        run: dotnet build LagProfiler.csproj --configuration Release
 
-      # Collect just what the mod folder needs on the phone: the built DLL + manifest.
-      - name: Stage mod output
+      - name: Package mod
         run: |
-          mkdir -p out/LagProfiler
-          find bin/Release -name "LagProfiler.dll" -exec cp {} out/LagProfiler/ \;
-          cp manifest.json out/LagProfiler/
+          mkdir -p output/LagProfiler
+          cp bin/Release/net9.0/LagProfiler.dll output/LagProfiler/
+          cp manifest.json output/LagProfiler/
+          cd output && zip -r LagProfiler.zip LagProfiler/
 
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: LagProfiler
-          path: out/LagProfiler
-
+          path: output/LagProfiler.zip
+          
