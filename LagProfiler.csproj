@@ -1,40 +1,33 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
-    <RootNamespace>LagProfiler</RootNamespace>
     <AssemblyName>LagProfiler</AssemblyName>
-
-    <!-- We're referencing the game's own DLLs directly, so don't let the SDK
-         try to resolve/copy framework assemblies that don't apply here. -->
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <RootNamespace>LagProfiler</RootNamespace>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>false</ImplicitUsings>
+    <Platforms>x86</Platforms>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Same libs/ folder pattern as SnsAndroidFix: the Android build of these DLLs
-         (StardewValley.dll is ~8MB vs PC's 20-30MB, missing some classes PC has).
-         Adjust filenames below to match exactly what's committed in libs/ if they differ. -->
     <Reference Include="StardewValley">
-      <HintPath>libs/StardewValley.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="StardewModdingAPI">
-      <HintPath>libs/StardewModdingAPI.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Netcode">
-      <HintPath>libs/Netcode.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="xTile">
-      <HintPath>libs/xTile.dll</HintPath>
+      <HintPath>libs\StardewValley.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="MonoGame.Framework">
-      <HintPath>libs/MonoGame.Framework.dll</HintPath>
+      <HintPath>libs\MonoGame.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewModdingAPI">
+      <HintPath>libs\StardewModdingAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>libs\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="xTile">
+      <HintPath>libs\xTile.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
