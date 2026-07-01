@@ -1,0 +1,41 @@
+name: Build LagProfiler
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore LagProfiler.csproj
+
+      - name: Build
+        run: dotnet build LagProfiler.csproj --configuration Release --no-restore
+
+      # Collect just what the mod folder needs on the phone: the built DLL + manifest.
+      - name: Stage mod output
+        run: |
+          mkdir -p out/LagProfiler
+          find bin/Release -name "LagProfiler.dll" -exec cp {} out/LagProfiler/ \;
+          cp manifest.json out/LagProfiler/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LagProfiler
+          path: out/LagProfiler
+
