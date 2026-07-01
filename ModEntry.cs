@@ -10,42 +10,60 @@ namespace LagProfiler
     public class ModEntry : Mod
     {
         // ---- Config (edit these numbers to tune sensitivity) ----
-        private const double SpikeThresholdMs = 50.0;   // ~below 20 FPS if a tick regularly takes this long
+        private const double SpikeThresholdMs = 50.0;   // ~below 20 FPS if a full frame regularly takes this long
         private const double SummaryIntervalSec = 5.0;  // how often to print the rolling summary
 
         private readonly Stopwatch _summaryStopwatch = new();
+        private readonly Stopwatch _frameStopwatch = new();
+        private readonly Stopwatch _updateStopwatch = new();
+        private readonly Stopwatch _drawStopwatch = new();
+
+        private bool _hasPreviousTick;
+
+        // Update/Draw durations measured during the span that just completed, captured at
+        // the start of the next tick (see OnUpdateTicking for why this ordering works).
+        private double _lastUpdateMs;
+        private double _lastDrawMs;
 
         private int _ticksInWindow;
         private double _msInWindow;
+        private double _updateMsInWindow;
+        private double _drawMsInWindow;
         private double _worstMsInWindow;
         private string _worstLocationInWindow = "-";
 
         public override void Entry(IModHelper helper)
         {
             helper.Events.GameLoop.UpdateTicking += OnUpdateTicking;
+            helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
+            helper.Events.Display.Rendering += OnRendering;
+            helper.Events.Display.Rendered += OnRendered;
             helper.Events.GameLoop.SaveLoaded += (_, _) =>
             {
                 _summaryStopwatch.Restart();
                 _frameStopwatch.Restart();
                 _hasPreviousTick = false;
+                _lastUpdateMs = 0;
+                _lastDrawMs = 0;
                 _ticksInWindow = 0;
                 _msInWindow = 0;
+                _updateMsInWindow = 0;
+                _drawMsInWindow = 0;
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
                 Monitor.Log("LagProfiler active. Watching for full frames (Update+Draw) slower than " + SpikeThresholdMs + "ms.", LogLevel.Info);
             };
         }
 
-        private readonly Stopwatch _frameStopwatch = new();
-        private bool _hasPreviousTick;
-
         private void OnUpdateTicking(object? sender, UpdateTickingEventArgs e)
         {
-            // Measuring UpdateTicking -> UpdateTicked only times the Update (logic) phase.
-            // Draw happens *after* UpdateTicked fires, so that approach completely misses
-            // render time — which is exactly where Android GPU bottlenecks show up.
-            // Instead, time from one UpdateTicking to the next: that span covers the full
-            // Update+Draw loop iteration, matching what an on-screen FPS counter sees.
+            // Game loop order per iteration: UpdateTicking -> ... -> UpdateTicked -> ... ->
+            // Rendering -> ... -> Rendered -> (loop) -> next UpdateTicking. So by the time
+            // this fires again, _lastUpdateMs/_lastDrawMs hold the Update and Draw durations
+            // for the span that just finished — measuring the full Update+Draw loop covers
+            // what an on-screen FPS counter actually sees, split into its two halves.
+            _updateStopwatch.Restart();
+
             if (!_hasPreviousTick)
             {
                 _frameStopwatch.Restart();
@@ -53,13 +71,28 @@ namespace LagProfiler
                 return;
             }
 
-            double elapsedMs = _frameStopwatch.Elapsed.TotalMilliseconds;
+            double frameMs = _frameStopwatch.Elapsed.TotalMilliseconds;
             _frameStopwatch.Restart();
 
-            ProcessFrameTime(elapsedMs);
+            ProcessFrameTime(frameMs, _lastUpdateMs, _lastDrawMs);
         }
 
-        private void ProcessFrameTime(double elapsedMs)
+        private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
+        {
+            _lastUpdateMs = _updateStopwatch.Elapsed.TotalMilliseconds;
+        }
+
+        private void OnRendering(object? sender, RenderingEventArgs e)
+        {
+            _drawStopwatch.Restart();
+        }
+
+        private void OnRendered(object? sender, RenderedEventArgs e)
+        {
+            _lastDrawMs = _drawStopwatch.Elapsed.TotalMilliseconds;
+        }
+
+        private void ProcessFrameTime(double elapsedMs, double updateMs, double drawMs)
         {
             if (!Context.IsWorldReady)
                 return;
@@ -69,6 +102,8 @@ namespace LagProfiler
 
             _ticksInWindow++;
             _msInWindow += elapsedMs;
+            _updateMsInWindow += updateMs;
+            _drawMsInWindow += drawMs;
             if (elapsedMs > _worstMsInWindow)
             {
                 _worstMsInWindow = elapsedMs;
@@ -78,9 +113,10 @@ namespace LagProfiler
             if (elapsedMs >= SpikeThresholdMs && loc != null)
             {
                 EntityCounts counts = GetEntityCounts(loc);
+                double otherMs = Math.Max(0, elapsedMs - updateMs - drawMs);
 
                 Monitor.Log(
-                    $"[SPIKE] {elapsedMs:F1}ms tick | location={locName} | NPCs={counts.NpcCount} | monsters={counts.MonsterCount} | "
+                    $"[SPIKE] {elapsedMs:F1}ms frame (update={updateMs:F1}ms draw={drawMs:F1}ms other={otherMs:F1}ms) | location={locName} | NPCs={counts.NpcCount} | monsters={counts.MonsterCount} | "
                     + $"objects={counts.ObjectCount} | sprinklers={counts.SprinklerCount} | kegs={counts.KegCount} | casks={counts.CaskCount} | "
                     + $"otherMachines={counts.OtherMachineCount} | buildings={counts.BuildingCount} | terrainFeatures={counts.TerrainFeatureCount} | "
                     + $"tempSprites={counts.TempSpriteCount} | debris={counts.DebrisCount} | playerTile={Game1.player.Tile}",
@@ -90,15 +126,21 @@ namespace LagProfiler
             if (_summaryStopwatch.Elapsed.TotalSeconds >= SummaryIntervalSec)
             {
                 double avgMs = _ticksInWindow > 0 ? _msInWindow / _ticksInWindow : 0;
+                double avgUpdateMs = _ticksInWindow > 0 ? _updateMsInWindow / _ticksInWindow : 0;
+                double avgDrawMs = _ticksInWindow > 0 ? _drawMsInWindow / _ticksInWindow : 0;
+                double avgOtherMs = Math.Max(0, avgMs - avgUpdateMs - avgDrawMs);
                 double approxFps = avgMs > 0 ? Math.Min(60.0, 1000.0 / avgMs) : 60.0;
 
                 Monitor.Log(
-                    $"[SUMMARY] last {SummaryIntervalSec}s: avg={avgMs:F1}ms (~{approxFps:F0} FPS) | worstTick={_worstMsInWindow:F1}ms at {_worstLocationInWindow} | currentLocation={locName}",
+                    $"[SUMMARY] last {SummaryIntervalSec}s: avg={avgMs:F1}ms (~{approxFps:F0} FPS) "
+                    + $"[update={avgUpdateMs:F1}ms draw={avgDrawMs:F1}ms other={avgOtherMs:F1}ms] | worstFrame={_worstMsInWindow:F1}ms at {_worstLocationInWindow} | currentLocation={locName}",
                     LogLevel.Info);
 
                 _summaryStopwatch.Restart();
                 _ticksInWindow = 0;
                 _msInWindow = 0;
+                _updateMsInWindow = 0;
+                _drawMsInWindow = 0;
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
             }
@@ -175,4 +217,3 @@ namespace LagProfiler
         }
     }
 }
-
