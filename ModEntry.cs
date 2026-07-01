@@ -3,7 +3,6 @@ using System.Diagnostics;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
-using StardewValley.Locations;
 using StardewValley.Monsters;
 
 namespace LagProfiler
@@ -152,11 +151,13 @@ namespace LagProfiler
             counts.TempSpriteCount = loc.TemporarySprites?.Count ?? 0;
             counts.DebrisCount = loc.debris?.Count ?? 0;
 
-            // Buildings only exist on farm-type / buildable locations.
-            if (loc is BuildableGameLocation buildable)
-                counts.BuildingCount = buildable.buildings?.Count ?? 0;
+            // Buildings only exist on farm-type locations. BuildableGameLocation was folded
+            // into GameLocation/Farm in 1.6, so check Farm specifically instead.
+            if (loc is Farm farm)
+                counts.BuildingCount = farm.buildings?.Count ?? 0;
 
             return counts;
         }
     }
 }
+
