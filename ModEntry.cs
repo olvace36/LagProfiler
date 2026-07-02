@@ -2,10 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
-using HarmonyLib;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
+using StardewValley.Mods;
 using StardewValley.Monsters;
 
 namespace LagProfiler
@@ -33,33 +35,40 @@ namespace LagProfiler
         private double _worstMsInWindow;
         private string _worstLocationInWindow = "-";
 
-        // ---- Multi-pass draw timing ----
-        // Times each named sub-pass of Game1's draw pipeline (world, weather, lighting, etc)
-        // via Harmony prefix/postfix pairs, so we can see which specific pass is actually
-        // eating the "draw" time reported above, instead of just knowing "draw = 41ms" with
-        // no idea where inside that 41ms it's going.
+        // ---- Multi-pass draw timing (via Game1's own hooks system) ----
+        // Game1 has a built-in extension point for exactly this: `Game1.hooks` is a
+        // `protected internal static ModHooks` field, and every major draw pass calls
+        // hooks.OnRendering(step, ...)/OnRendered(step, ...) with a RenderSteps value
+        // (HUD, World, World_Background, World_Sorted, World_AlwaysFront, World_Weather,
+        // World_RenderLightmap, World_DrawLightmapOnScreen, Menu, GlobalFade, Overlays, etc)
+        // — see StardewValley.Mods.RenderSteps / StardewValley.Mods.ModHooks in the
+        // decompiled source. Wrapping this (instead of Harmony-patching each draw method
+        // individually) gives an exact, official breakdown with far less risk of colliding
+        // with other mods that patch the same private methods.
         //
-        // Method names here are the exact private/public method names on Game1 as found in
-        // the decompiled source — see StardewValley/Game1.cs: DrawWorld, drawWeather,
-        // DrawLighting, DrawLightmapOnScreen, DrawCharacterEmotes, DrawScreenOverlaySprites,
-        // DrawGlobalFade.
-        private static readonly string[] PassNames =
-        {
-            "DrawWorld",
-            "drawWeather",
-            "DrawLighting",
-            "DrawLightmapOnScreen",
-            "DrawCharacterEmotes",
-            "DrawScreenOverlaySprites",
-            "DrawGlobalFade",
-            "drawHUD",
-            "DrawOverlays",
-            "DrawMenu",
-        };
+        // IMPORTANT: we CHAIN to whatever hooks instance was already installed (likely
+        // SMAPI's own) rather than replacing it outright, so we don't break anything else
+        // relying on Game1.hooks.
+        private static readonly Dictionary<RenderSteps, Stopwatch> StepStopwatches = new();
+        private static readonly Dictionary<RenderSteps, double> LastStepMs = new();
+        private readonly Dictionary<RenderSteps, double> _stepMsInWindow = new();
 
-        private static readonly Dictionary<string, Stopwatch> PassStopwatches = new();
-        private static readonly Dictionary<string, double> LastPassMs = new();
-        private readonly Dictionary<string, double> _passMsInWindow = new();
+        private static readonly RenderSteps[] TrackedSteps =
+        {
+            RenderSteps.HUD,
+            RenderSteps.World,
+            RenderSteps.World_Background,
+            RenderSteps.World_Sorted,
+            RenderSteps.World_AlwaysFront,
+            RenderSteps.World_Weather,
+            RenderSteps.World_RenderLightmap,
+            RenderSteps.World_DrawLightmapOnScreen,
+            RenderSteps.Menu,
+            RenderSteps.MenuBackground,
+            RenderSteps.GlobalFade,
+            RenderSteps.Overlays,
+            RenderSteps.DialogueBox,
+        };
 
         public override void Entry(IModHelper helper)
         {
@@ -80,70 +89,77 @@ namespace LagProfiler
                 _drawMsInWindow = 0;
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
-                _passMsInWindow.Clear();
-                foreach (var name in PassNames)
-                    LastPassMs[name] = 0;
+                _stepMsInWindow.Clear();
+                foreach (var step in TrackedSteps)
+                    LastStepMs[step] = 0;
                 Monitor.Log("LagProfiler active. Watching for full frames (Update+Draw) slower than " + SpikeThresholdMs + "ms.", LogLevel.Info);
             };
 
+            InstallRenderStepHooks();
+        }
+
+        private void InstallRenderStepHooks()
+        {
             try
             {
-                var harmony = new Harmony(this.ModManifest.UniqueID);
-                int patchedCount = 0;
-
-                foreach (var name in PassNames)
+                foreach (var step in TrackedSteps)
                 {
-                    try
-                    {
-                        var method = AccessTools.Method(typeof(Game1), name);
-                        if (method == null)
-                        {
-                            Monitor.Log($"Could not find Game1.{name} to time — skipping that pass.", LogLevel.Warn);
-                            continue;
-                        }
-
-                        PassStopwatches[name] = new Stopwatch();
-                        LastPassMs[name] = 0;
-
-                        harmony.Patch(
-                            original: method,
-                            prefix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Prefix)),
-                            postfix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Postfix))
-                        );
-                        patchedCount++;
-                    }
-                    catch (Exception exInner)
-                    {
-                        Monitor.Log($"Could not time Game1.{name}, skipping just that pass: {exInner.Message}", LogLevel.Warn);
-                    }
+                    StepStopwatches[step] = new Stopwatch();
+                    LastStepMs[step] = 0;
                 }
 
-                Monitor.Log($"Draw sub-pass timing attached to {patchedCount}/{PassNames.Length} passes.", LogLevel.Info);
+                FieldInfo? hooksField = typeof(Game1).GetField("hooks",
+                    BindingFlags.NonPublic | BindingFlags.Static);
+                if (hooksField == null)
+                {
+                    Monitor.Log("Could not find Game1.hooks field — render-step timing disabled, but frame/update/draw totals still work fine.", LogLevel.Warn);
+                    return;
+                }
+
+                var existingHooks = hooksField.GetValue(null) as ModHooks;
+                var timingHooks = new TimingModHooks(existingHooks);
+                hooksField.SetValue(null, timingHooks);
+
+                Monitor.Log($"Render-step timing installed (chained to {(existingHooks == null ? "no prior hooks" : existingHooks.GetType().Name)}), tracking {TrackedSteps.Length} steps.", LogLevel.Info);
             }
             catch (Exception ex)
             {
-                // If any of this fails (game version differences, etc), the rest of
-                // LagProfiler (frame/update/draw totals) still works fine without it.
-                Monitor.Log($"Could not attach draw sub-pass timing, skipping that part: {ex.Message}", LogLevel.Warn);
+                Monitor.Log($"Could not install render-step timing, skipping that part: {ex.Message}", LogLevel.Warn);
             }
         }
 
         /// <summary>
-        /// Shared prefix/postfix used for every patched sub-pass — looks up which pass called
-        /// it via __originalMethod instead of needing one copy-pasted method pair per pass.
+        /// Wraps the game's existing ModHooks instance to time each RenderSteps pass.
+        /// Always forwards to the inner hooks and returns/preserves its result — never
+        /// changes actual rendering behavior, only observes timing around it.
         /// </summary>
-        internal static class PassTimingPatches
+        private class TimingModHooks : ModHooks
         {
-            internal static void Prefix(MethodBase __originalMethod)
+            private readonly ModHooks? _inner;
+
+            public TimingModHooks(ModHooks? inner)
             {
-                if (PassStopwatches.TryGetValue(__originalMethod.Name, out var sw))
-                    sw.Restart();
+                _inner = inner;
             }
 
-            internal static void Postfix(MethodBase __originalMethod)
+            public override bool OnRendering(RenderSteps step, SpriteBatch sb, GameTime time, RenderTarget2D target_screen)
             {
-                if (PassStopwatches.TryGetValue(__originalMethod.Name, out var sw))
-                    LastPassMs[__originalMethod.Name] = sw.Elapsed.TotalMilliseconds;
+                if (StepStopwatches.TryGetValue(step, out var sw))
+                    sw.Restart();
+
+                // Preserve whatever the previously-installed hooks would have done.
+                return _inner?.OnRendering(step, sb, time, target_screen) ?? base.OnRendering(step, sb, time, target_screen);
+            }
+
+            public override void OnRendered(RenderSteps step, SpriteBatch sb, GameTime time, RenderTarget2D target_screen)
+            {
+                if (StepStopwatches.TryGetValue(step, out var sw))
+                    LastStepMs[step] = sw.Elapsed.TotalMilliseconds;
+
+                if (_inner != null)
+                    _inner.OnRendered(step, sb, time, target_screen);
+                else
+                    base.OnRendered(step, sb, time, target_screen);
             }
         }
 
@@ -161,13 +177,13 @@ namespace LagProfiler
             double frameMs = _frameStopwatch.Elapsed.TotalMilliseconds;
             _frameStopwatch.Restart();
 
-            // Snapshot this frame's pass timings, then reset them so a pass that didn't run
-            // this frame (e.g. no weather) correctly shows as 0 rather than a stale value.
-            var passSnapshot = new Dictionary<string, double>(LastPassMs);
-            foreach (var name in PassNames)
-                LastPassMs[name] = 0;
+            // Snapshot this frame's per-step timings, then reset so a step that didn't run
+            // this frame (e.g. no menu open) correctly shows 0 rather than a stale value.
+            var stepSnapshot = new Dictionary<RenderSteps, double>(LastStepMs);
+            foreach (var step in TrackedSteps)
+                LastStepMs[step] = 0;
 
-            ProcessFrameTime(frameMs, _lastUpdateMs, _lastDrawMs, passSnapshot);
+            ProcessFrameTime(frameMs, _lastUpdateMs, _lastDrawMs, stepSnapshot);
         }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -185,15 +201,15 @@ namespace LagProfiler
             _lastDrawMs = _drawStopwatch.Elapsed.TotalMilliseconds;
         }
 
-        private static string FormatPasses(Dictionary<string, double> passes)
+        private static string FormatSteps(Dictionary<RenderSteps, double> steps)
         {
             var parts = new List<string>();
-            foreach (var name in PassNames)
-                parts.Add($"{name}={(passes.TryGetValue(name, out var ms) ? ms : 0):F1}ms");
+            foreach (var step in TrackedSteps)
+                parts.Add($"{step}={(steps.TryGetValue(step, out var ms) ? ms : 0):F1}ms");
             return string.Join(" ", parts);
         }
 
-        private void ProcessFrameTime(double elapsedMs, double updateMs, double drawMs, Dictionary<string, double> passes)
+        private void ProcessFrameTime(double elapsedMs, double updateMs, double drawMs, Dictionary<RenderSteps, double> steps)
         {
             if (!Context.IsWorldReady)
                 return;
@@ -205,8 +221,8 @@ namespace LagProfiler
             _msInWindow += elapsedMs;
             _updateMsInWindow += updateMs;
             _drawMsInWindow += drawMs;
-            foreach (var kv in passes)
-                _passMsInWindow[kv.Key] = _passMsInWindow.GetValueOrDefault(kv.Key, 0) + kv.Value;
+            foreach (var kv in steps)
+                _stepMsInWindow[kv.Key] = _stepMsInWindow.GetValueOrDefault(kv.Key, 0) + kv.Value;
 
             if (elapsedMs > _worstMsInWindow)
             {
@@ -220,7 +236,7 @@ namespace LagProfiler
                 double otherMs = Math.Max(0, elapsedMs - updateMs - drawMs);
 
                 Monitor.Log(
-                    $"[SPIKE] {elapsedMs:F1}ms frame (update={updateMs:F1}ms draw={drawMs:F1}ms other={otherMs:F1}ms) [{FormatPasses(passes)}] | location={locName} | NPCs={counts.NpcCount} | monsters={counts.MonsterCount} | "
+                    $"[SPIKE] {elapsedMs:F1}ms frame (update={updateMs:F1}ms draw={drawMs:F1}ms other={otherMs:F1}ms) [{FormatSteps(steps)}] | location={locName} | NPCs={counts.NpcCount} | monsters={counts.MonsterCount} | "
                     + $"objects={counts.ObjectCount} | sprinklers={counts.SprinklerCount} | kegs={counts.KegCount} | casks={counts.CaskCount} | "
                     + $"otherMachines={counts.OtherMachineCount} | buildings={counts.BuildingCount} | terrainFeatures={counts.TerrainFeatureCount} | "
                     + $"tempSprites={counts.TempSpriteCount} | debris={counts.DebrisCount} | playerTile={Game1.player.Tile}",
@@ -235,13 +251,13 @@ namespace LagProfiler
                 double avgOtherMs = Math.Max(0, avgMs - avgUpdateMs - avgDrawMs);
                 double approxFps = avgMs > 0 ? Math.Min(60.0, 1000.0 / avgMs) : 60.0;
 
-                var avgPasses = new Dictionary<string, double>();
-                foreach (var name in PassNames)
-                    avgPasses[name] = _ticksInWindow > 0 ? _passMsInWindow.GetValueOrDefault(name, 0) / _ticksInWindow : 0;
+                var avgSteps = new Dictionary<RenderSteps, double>();
+                foreach (var step in TrackedSteps)
+                    avgSteps[step] = _ticksInWindow > 0 ? _stepMsInWindow.GetValueOrDefault(step, 0) / _ticksInWindow : 0;
 
                 Monitor.Log(
                     $"[SUMMARY] last {SummaryIntervalSec}s: avg={avgMs:F1}ms (~{approxFps:F0} FPS) "
-                    + $"[update={avgUpdateMs:F1}ms draw={avgDrawMs:F1}ms other={avgOtherMs:F1}ms] [{FormatPasses(avgPasses)}] | worstFrame={_worstMsInWindow:F1}ms at {_worstLocationInWindow} | currentLocation={locName}",
+                    + $"[update={avgUpdateMs:F1}ms draw={avgDrawMs:F1}ms other={avgOtherMs:F1}ms] [{FormatSteps(avgSteps)}] | worstFrame={_worstMsInWindow:F1}ms at {_worstLocationInWindow} | currentLocation={locName}",
                     LogLevel.Info);
 
                 _summaryStopwatch.Restart();
@@ -249,7 +265,7 @@ namespace LagProfiler
                 _msInWindow = 0;
                 _updateMsInWindow = 0;
                 _drawMsInWindow = 0;
-                _passMsInWindow.Clear();
+                _stepMsInWindow.Clear();
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
             }
