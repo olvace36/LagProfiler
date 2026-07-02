@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
+using HarmonyLib;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -20,8 +23,6 @@ namespace LagProfiler
 
         private bool _hasPreviousTick;
 
-        // Update/Draw durations measured during the span that just completed, captured at
-        // the start of the next tick (see OnUpdateTicking for why this ordering works).
         private double _lastUpdateMs;
         private double _lastDrawMs;
 
@@ -31,6 +32,31 @@ namespace LagProfiler
         private double _drawMsInWindow;
         private double _worstMsInWindow;
         private string _worstLocationInWindow = "-";
+
+        // ---- Multi-pass draw timing ----
+        // Times each named sub-pass of Game1's draw pipeline (world, weather, lighting, etc)
+        // via Harmony prefix/postfix pairs, so we can see which specific pass is actually
+        // eating the "draw" time reported above, instead of just knowing "draw = 41ms" with
+        // no idea where inside that 41ms it's going.
+        //
+        // Method names here are the exact private/public method names on Game1 as found in
+        // the decompiled source — see StardewValley/Game1.cs: DrawWorld, drawWeather,
+        // DrawLighting, DrawLightmapOnScreen, DrawCharacterEmotes, DrawScreenOverlaySprites,
+        // DrawGlobalFade.
+        private static readonly string[] PassNames =
+        {
+            "DrawWorld",
+            "drawWeather",
+            "DrawLighting",
+            "DrawLightmapOnScreen",
+            "DrawCharacterEmotes",
+            "DrawScreenOverlaySprites",
+            "DrawGlobalFade",
+        };
+
+        private static readonly Dictionary<string, Stopwatch> PassStopwatches = new();
+        private static readonly Dictionary<string, double> LastPassMs = new();
+        private readonly Dictionary<string, double> _passMsInWindow = new();
 
         public override void Entry(IModHelper helper)
         {
@@ -51,17 +77,68 @@ namespace LagProfiler
                 _drawMsInWindow = 0;
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
+                _passMsInWindow.Clear();
+                foreach (var name in PassNames)
+                    LastPassMs[name] = 0;
                 Monitor.Log("LagProfiler active. Watching for full frames (Update+Draw) slower than " + SpikeThresholdMs + "ms.", LogLevel.Info);
             };
+
+            try
+            {
+                var harmony = new Harmony(this.ModManifest.UniqueID);
+                int patchedCount = 0;
+
+                foreach (var name in PassNames)
+                {
+                    var method = AccessTools.Method(typeof(Game1), name);
+                    if (method == null)
+                    {
+                        Monitor.Log($"Could not find Game1.{name} to time — skipping that pass.", LogLevel.Warn);
+                        continue;
+                    }
+
+                    PassStopwatches[name] = new Stopwatch();
+                    LastPassMs[name] = 0;
+
+                    harmony.Patch(
+                        original: method,
+                        prefix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Prefix)),
+                        postfix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Postfix))
+                    );
+                    patchedCount++;
+                }
+
+                Monitor.Log($"Draw sub-pass timing attached to {patchedCount}/{PassNames.Length} passes.", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                // If any of this fails (game version differences, etc), the rest of
+                // LagProfiler (frame/update/draw totals) still works fine without it.
+                Monitor.Log($"Could not attach draw sub-pass timing, skipping that part: {ex.Message}", LogLevel.Warn);
+            }
+        }
+
+        /// <summary>
+        /// Shared prefix/postfix used for every patched sub-pass — looks up which pass called
+        /// it via __originalMethod instead of needing one copy-pasted method pair per pass.
+        /// </summary>
+        internal static class PassTimingPatches
+        {
+            internal static void Prefix(MethodBase __originalMethod)
+            {
+                if (PassStopwatches.TryGetValue(__originalMethod.Name, out var sw))
+                    sw.Restart();
+            }
+
+            internal static void Postfix(MethodBase __originalMethod)
+            {
+                if (PassStopwatches.TryGetValue(__originalMethod.Name, out var sw))
+                    LastPassMs[__originalMethod.Name] = sw.Elapsed.TotalMilliseconds;
+            }
         }
 
         private void OnUpdateTicking(object? sender, UpdateTickingEventArgs e)
         {
-            // Game loop order per iteration: UpdateTicking -> ... -> UpdateTicked -> ... ->
-            // Rendering -> ... -> Rendered -> (loop) -> next UpdateTicking. So by the time
-            // this fires again, _lastUpdateMs/_lastDrawMs hold the Update and Draw durations
-            // for the span that just finished — measuring the full Update+Draw loop covers
-            // what an on-screen FPS counter actually sees, split into its two halves.
             _updateStopwatch.Restart();
 
             if (!_hasPreviousTick)
@@ -74,7 +151,13 @@ namespace LagProfiler
             double frameMs = _frameStopwatch.Elapsed.TotalMilliseconds;
             _frameStopwatch.Restart();
 
-            ProcessFrameTime(frameMs, _lastUpdateMs, _lastDrawMs);
+            // Snapshot this frame's pass timings, then reset them so a pass that didn't run
+            // this frame (e.g. no weather) correctly shows as 0 rather than a stale value.
+            var passSnapshot = new Dictionary<string, double>(LastPassMs);
+            foreach (var name in PassNames)
+                LastPassMs[name] = 0;
+
+            ProcessFrameTime(frameMs, _lastUpdateMs, _lastDrawMs, passSnapshot);
         }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -92,7 +175,15 @@ namespace LagProfiler
             _lastDrawMs = _drawStopwatch.Elapsed.TotalMilliseconds;
         }
 
-        private void ProcessFrameTime(double elapsedMs, double updateMs, double drawMs)
+        private static string FormatPasses(Dictionary<string, double> passes)
+        {
+            var parts = new List<string>();
+            foreach (var name in PassNames)
+                parts.Add($"{name}={(passes.TryGetValue(name, out var ms) ? ms : 0):F1}ms");
+            return string.Join(" ", parts);
+        }
+
+        private void ProcessFrameTime(double elapsedMs, double updateMs, double drawMs, Dictionary<string, double> passes)
         {
             if (!Context.IsWorldReady)
                 return;
@@ -104,6 +195,9 @@ namespace LagProfiler
             _msInWindow += elapsedMs;
             _updateMsInWindow += updateMs;
             _drawMsInWindow += drawMs;
+            foreach (var kv in passes)
+                _passMsInWindow[kv.Key] = _passMsInWindow.GetValueOrDefault(kv.Key, 0) + kv.Value;
+
             if (elapsedMs > _worstMsInWindow)
             {
                 _worstMsInWindow = elapsedMs;
@@ -116,7 +210,7 @@ namespace LagProfiler
                 double otherMs = Math.Max(0, elapsedMs - updateMs - drawMs);
 
                 Monitor.Log(
-                    $"[SPIKE] {elapsedMs:F1}ms frame (update={updateMs:F1}ms draw={drawMs:F1}ms other={otherMs:F1}ms) | location={locName} | NPCs={counts.NpcCount} | monsters={counts.MonsterCount} | "
+                    $"[SPIKE] {elapsedMs:F1}ms frame (update={updateMs:F1}ms draw={drawMs:F1}ms other={otherMs:F1}ms) [{FormatPasses(passes)}] | location={locName} | NPCs={counts.NpcCount} | monsters={counts.MonsterCount} | "
                     + $"objects={counts.ObjectCount} | sprinklers={counts.SprinklerCount} | kegs={counts.KegCount} | casks={counts.CaskCount} | "
                     + $"otherMachines={counts.OtherMachineCount} | buildings={counts.BuildingCount} | terrainFeatures={counts.TerrainFeatureCount} | "
                     + $"tempSprites={counts.TempSpriteCount} | debris={counts.DebrisCount} | playerTile={Game1.player.Tile}",
@@ -131,9 +225,13 @@ namespace LagProfiler
                 double avgOtherMs = Math.Max(0, avgMs - avgUpdateMs - avgDrawMs);
                 double approxFps = avgMs > 0 ? Math.Min(60.0, 1000.0 / avgMs) : 60.0;
 
+                var avgPasses = new Dictionary<string, double>();
+                foreach (var name in PassNames)
+                    avgPasses[name] = _ticksInWindow > 0 ? _passMsInWindow.GetValueOrDefault(name, 0) / _ticksInWindow : 0;
+
                 Monitor.Log(
                     $"[SUMMARY] last {SummaryIntervalSec}s: avg={avgMs:F1}ms (~{approxFps:F0} FPS) "
-                    + $"[update={avgUpdateMs:F1}ms draw={avgDrawMs:F1}ms other={avgOtherMs:F1}ms] | worstFrame={_worstMsInWindow:F1}ms at {_worstLocationInWindow} | currentLocation={locName}",
+                    + $"[update={avgUpdateMs:F1}ms draw={avgDrawMs:F1}ms other={avgOtherMs:F1}ms] [{FormatPasses(avgPasses)}] | worstFrame={_worstMsInWindow:F1}ms at {_worstLocationInWindow} | currentLocation={locName}",
                     LogLevel.Info);
 
                 _summaryStopwatch.Restart();
@@ -141,6 +239,7 @@ namespace LagProfiler
                 _msInWindow = 0;
                 _updateMsInWindow = 0;
                 _drawMsInWindow = 0;
+                _passMsInWindow.Clear();
                 _worstMsInWindow = 0;
                 _worstLocationInWindow = "-";
             }
@@ -161,16 +260,10 @@ namespace LagProfiler
             public int DebrisCount;
         }
 
-        /// <summary>
-        /// Counts NPCs/monsters/machines/etc in the given location. Defensive on purpose
-        /// (null checks everywhere) since this runs on every lag spike and must never itself
-        /// add extra lag or throw.
-        /// </summary>
         private EntityCounts GetEntityCounts(GameLocation loc)
         {
             var counts = new EntityCounts();
 
-            // characters holds both NPCs and monsters (Monster : NPC in 1.6), so split by type.
             if (loc.characters != null)
             {
                 foreach (NPC npc in loc.characters)
@@ -208,8 +301,6 @@ namespace LagProfiler
             counts.TempSpriteCount = loc.TemporarySprites?.Count ?? 0;
             counts.DebrisCount = loc.debris?.Count ?? 0;
 
-            // Buildings only exist on farm-type locations. BuildableGameLocation was folded
-            // into GameLocation/Farm in 1.6, so check Farm specifically instead.
             if (loc is Farm farm)
                 counts.BuildingCount = farm.buildings?.Count ?? 0;
 
