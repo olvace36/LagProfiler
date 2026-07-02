@@ -55,6 +55,7 @@ namespace LagProfiler
 
         private static readonly RenderSteps[] TrackedSteps =
         {
+            RenderSteps.FullScene,
             RenderSteps.HUD,
             RenderSteps.World,
             RenderSteps.World_Background,
@@ -76,6 +77,15 @@ namespace LagProfiler
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
             helper.Events.Display.Rendering += OnRendering;
             helper.Events.Display.Rendered += OnRendered;
+
+            // NOTE on measuring other mods' draw time: no extra instrumentation is needed.
+            // Our draw= total (Display.Rendering -> Display.Rendered) covers EVERYTHING:
+            // Game1's own rendering plus every other mod's event-based overlay drawing.
+            // FullScene= covers only Game1._draw() itself. Therefore:
+            //     draw - FullScene ≈ total time all other mods spend drawing overlays.
+            // That difference is the number that identifies whether "other mods" are the
+            // bottleneck, without touching any of their code.
+
             helper.Events.GameLoop.SaveLoaded += (_, _) =>
             {
                 _summaryStopwatch.Restart();
