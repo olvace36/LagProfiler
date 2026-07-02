@@ -52,6 +52,9 @@ namespace LagProfiler
             "DrawCharacterEmotes",
             "DrawScreenOverlaySprites",
             "DrawGlobalFade",
+            "drawHUD",
+            "DrawOverlays",
+            "DrawMenu",
         };
 
         private static readonly Dictionary<string, Stopwatch> PassStopwatches = new();
@@ -90,22 +93,29 @@ namespace LagProfiler
 
                 foreach (var name in PassNames)
                 {
-                    var method = AccessTools.Method(typeof(Game1), name);
-                    if (method == null)
+                    try
                     {
-                        Monitor.Log($"Could not find Game1.{name} to time — skipping that pass.", LogLevel.Warn);
-                        continue;
+                        var method = AccessTools.Method(typeof(Game1), name);
+                        if (method == null)
+                        {
+                            Monitor.Log($"Could not find Game1.{name} to time — skipping that pass.", LogLevel.Warn);
+                            continue;
+                        }
+
+                        PassStopwatches[name] = new Stopwatch();
+                        LastPassMs[name] = 0;
+
+                        harmony.Patch(
+                            original: method,
+                            prefix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Prefix)),
+                            postfix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Postfix))
+                        );
+                        patchedCount++;
                     }
-
-                    PassStopwatches[name] = new Stopwatch();
-                    LastPassMs[name] = 0;
-
-                    harmony.Patch(
-                        original: method,
-                        prefix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Prefix)),
-                        postfix: new HarmonyMethod(typeof(PassTimingPatches), nameof(PassTimingPatches.Postfix))
-                    );
-                    patchedCount++;
+                    catch (Exception exInner)
+                    {
+                        Monitor.Log($"Could not time Game1.{name}, skipping just that pass: {exInner.Message}", LogLevel.Warn);
+                    }
                 }
 
                 Monitor.Log($"Draw sub-pass timing attached to {patchedCount}/{PassNames.Length} passes.", LogLevel.Info);
